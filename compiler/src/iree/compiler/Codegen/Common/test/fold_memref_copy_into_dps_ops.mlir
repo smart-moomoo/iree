@@ -54,6 +54,75 @@ func.func @no_fold_copy_source_aliases_target(%target: memref<4xf32>) {
 
 // -----
 
+func.func @elide_linalg_fill_init_copy() {
+  %c0 = arith.constant 0.0 : f32
+  %source = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  linalg.fill ins(%c0 : f32) outs(%temp : memref<4xf32>)
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @elide_linalg_fill_init_copy(
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: linalg.fill
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
+func.func @elide_linalg_copy_init_copy() {
+  %source = memref.alloc() : memref<4xf32>
+  %input = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  linalg.copy ins(%input : memref<4xf32>) outs(%temp : memref<4xf32>)
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @elide_linalg_copy_init_copy(
+// CHECK-DAG: %[[INPUT:.+]] = memref.alloc
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: linalg.copy ins(%[[INPUT]] : memref<4xf32>)
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
+#map = affine_map<(d0) -> (d0)>
+
+func.func @elide_linalg_generic_init_copy() {
+  %source = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  linalg.generic {
+    indexing_maps = [#map],
+    iterator_types = ["parallel"]
+  } outs(%temp : memref<4xf32>) {
+  ^bb0(%old: f32):
+    %c1 = arith.constant 1.0 : f32
+    linalg.yield %c1 : f32
+  }
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @elide_linalg_generic_init_copy(
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: linalg.generic
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
 memref.global "private" @source_global : memref<4xf32> = dense<0.0>
 memref.global "private" @target_global : memref<4xf32> = dense<0.0>
 

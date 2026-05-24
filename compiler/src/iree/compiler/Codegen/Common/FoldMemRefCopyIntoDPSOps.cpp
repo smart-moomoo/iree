@@ -7,7 +7,9 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "llvm/ADT/STLExtras.h"
 #include "mlir/Analysis/AliasAnalysis.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
@@ -177,6 +179,48 @@ static bool targetMayAliasDpsReads(DestinationStyleOpInterface dpsOp,
   return false;
 }
 
+// Returns true when a Linalg op defines every element of the forwarded init
+// without reading its old contents:
+//
+//   linalg.fill/copy                         always overwrite
+//   generic parallel (d0, d1) -> (d0, d1)  overwrite if %old is unused
+//   generic reduction or one using %old     not proven
+//
+// Requiring an identity output map makes every parallel loop point correspond
+// to one output element. Other maps may also cover the output but need a more
+// general surjectivity proof.
+static bool linalgOpFullyOverwritesInit(linalg::LinalgOp linalgOp,
+                                        OpOperand *initOperand) {
+  Operation *op = linalgOp.getOperation();
+  if (isa<linalg::FillOp, linalg::CopyOp>(op)) {
+    return true;
+  }
+
+  auto genericOp = dyn_cast<linalg::GenericOp>(op);
+  if (!genericOp ||
+      !llvm::all_of(genericOp.getIteratorTypesArray(),
+                    linalg::isParallelIterator)) {
+    return false;
+  }
+
+  AffineMap initMap = genericOp.getMatchingIndexingMap(initOperand);
+  auto initType = dyn_cast<MemRefType>(initOperand->get().getType());
+  if (!initType || initMap.getNumDims() != initType.getRank() ||
+      initMap.getNumResults() != initType.getRank() || !initMap.isIdentity()) {
+    return false;
+  }
+
+  Value blockArg = genericOp.getMatchingBlockArgument(initOperand);
+  return blockArg && blockArg.use_empty();
+}
+
+static bool dpsInitCopyCanBeElided(DestinationStyleOpInterface dpsOp,
+                                   OpOperand *forwardedInitOperand) {
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(dpsOp.getOperation());
+  return linalgOp &&
+         linalgOpFullyOverwritesInit(linalgOp, forwardedInitOperand);
+}
+
 struct FoldTemporaryCopyIntoDpsOp final : OpRewritePattern<memref::CopyOp> {
   FoldTemporaryCopyIntoDpsOp(MLIRContext *context, AliasAnalysis &aliasAnalysis)
       : OpRewritePattern(context), aliasAnalysis(aliasAnalysis) {}
@@ -248,8 +292,10 @@ struct FoldTemporaryCopyIntoDpsOp final : OpRewritePattern<memref::CopyOp> {
     }
 
     rewriter.setInsertionPoint(copyIn);
-    memref::CopyOp::create(rewriter, copyIn.getLoc(), copyIn.getSource(),
-                           finalTarget);
+    if (!dpsInitCopyCanBeElided(dpsOp, forwardedInitOperand)) {
+      memref::CopyOp::create(rewriter, copyIn.getLoc(), copyIn.getSource(),
+                             finalTarget);
+    }
     forwardedInitOperand->set(finalTarget);
 
     rewriter.eraseOp(copyOut);

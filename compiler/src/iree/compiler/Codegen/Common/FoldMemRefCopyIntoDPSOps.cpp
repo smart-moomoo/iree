@@ -7,6 +7,8 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "mlir/Analysis/AliasAnalysis.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -14,10 +16,13 @@
 #include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+#include <limits>
 
 namespace mlir::iree_compiler {
 
@@ -214,11 +219,148 @@ static bool linalgOpFullyOverwritesInit(linalg::LinalgOp linalgOp,
   return blockArg && blockArg.use_empty();
 }
 
+static std::optional<int64_t> getStaticNumElements(ArrayRef<int64_t> shape) {
+  int64_t count = 1;
+  for (int64_t dim : shape) {
+    if (ShapedType::isDynamic(dim) || dim < 0) {
+      return std::nullopt;
+    }
+    if (dim == 0) {
+      return 0;
+    }
+    if (count > std::numeric_limits<int64_t>::max() / dim) {
+      return std::nullopt;
+    }
+    count *= dim;
+  }
+  return count;
+}
+
+static DenseIntElementsAttr getConstantGlobalIndices(Value value) {
+  auto getGlobal = value.getDefiningOp<memref::GetGlobalOp>();
+  if (!getGlobal) {
+    return {};
+  }
+
+  auto globalOp = dyn_cast_if_present<memref::GlobalOp>(
+      SymbolTable::lookupNearestSymbolFrom(getGlobal, getGlobal.getNameAttr()));
+  if (!globalOp || !globalOp.getConstant()) {
+    return {};
+  }
+  return dyn_cast_if_present<DenseIntElementsAttr>(
+      globalOp.getInitialValueAttr());
+}
+
+// Returns true when every element of a scatter destination is replaced without
+// consulting its previous value. This proof deliberately accepts only a form
+// whose coverage can be enumerated at compile time:
+//
+//   * scalar, unmasked updates with unique indices;
+//   * static source, index, and destination shapes;
+//   * constant indices stored in a memref.global;
+//   * an identity dimension map and an unused %old region argument.
+//
+// For a `memref<4xf32>` destination, indices [[0], [1], [2], [3]] cover all
+// four elements. Indices [[0], [2]] leave gaps, while [[0], [1], [1], [3]]
+// contain a duplicate; both preserve the initialization copy.
+static bool scatterFullyOverwritesInit(IREE::LinalgExt::ScatterOp scatterOp,
+                                       OpOperand *initOperand) {
+  if (initOperand != scatterOp.getDpsInitOperand(0) || scatterOp.getMask() ||
+      !scatterOp.getUniqueIndices() || !scatterOp.isScalarUpdate()) {
+    return false;
+  }
+
+  Block &body = scatterOp.getRegion().front();
+  if (body.getNumArguments() != 2 || !body.getArgument(1).use_empty()) {
+    return false;
+  }
+
+  ShapedType originalType = scatterOp.getOriginalType();
+  ShapedType updateType = scatterOp.getUpdateType();
+  ShapedType indicesType = scatterOp.getIndicesType();
+  if (!originalType.hasStaticShape() || !updateType.hasStaticShape() ||
+      !indicesType.hasStaticShape()) {
+    return false;
+  }
+
+  int64_t indexDepth = scatterOp.getIndexDepth();
+  int64_t batchRank = scatterOp.getBatchRank();
+  for (auto [index, dimension] : llvm::enumerate(scatterOp.getDimensionMap())) {
+    if (dimension != static_cast<int64_t>(index)) {
+      return false;
+    }
+  }
+
+  bool indexDepthDimensionOmitted = indicesType.getRank() == batchRank;
+  if (indexDepthDimensionOmitted && indexDepth != 1) {
+    return false;
+  }
+
+  std::optional<int64_t> updateCount =
+      getStaticNumElements(updateType.getShape().take_front(batchRank));
+  std::optional<int64_t> destinationCount =
+      getStaticNumElements(originalType.getShape());
+  if (!updateCount || !destinationCount || *updateCount != *destinationCount) {
+    return false;
+  }
+
+  DenseIntElementsAttr indices =
+      getConstantGlobalIndices(scatterOp.getIndices());
+  if (!indices) {
+    return false;
+  }
+
+  int64_t valuesPerIndex = indexDepthDimensionOmitted ? 1 : indexDepth;
+  if (*updateCount >
+      std::numeric_limits<int64_t>::max() / valuesPerIndex) {
+    return false;
+  }
+  int64_t expectedIndexValueCount = *updateCount * valuesPerIndex;
+  if (indices.getNumElements() != expectedIndexValueCount) {
+    return false;
+  }
+
+  SmallVector<int64_t> indexValues;
+  indexValues.reserve(expectedIndexValueCount);
+  for (APInt value : indices.getValues<APInt>()) {
+    if (value.getBitWidth() > 64) {
+      return false;
+    }
+    indexValues.push_back(value.getSExtValue());
+  }
+
+  ArrayRef<int64_t> destinationShape = originalType.getShape();
+  llvm::DenseSet<int64_t> coveredElements;
+  coveredElements.reserve(*updateCount);
+  for (int64_t update = 0; update < *updateCount; ++update) {
+    int64_t linearIndex = 0;
+    for (int64_t dim = 0; dim < indexDepth; ++dim) {
+      int64_t coordinate = indexValues[update * valuesPerIndex + dim];
+      int64_t dimSize = destinationShape[dim];
+      if (coordinate < 0 || coordinate >= dimSize ||
+          linearIndex > std::numeric_limits<int64_t>::max() / dimSize) {
+        return false;
+      }
+      linearIndex = linearIndex * dimSize + coordinate;
+    }
+    if (!coveredElements.insert(linearIndex).second) {
+      return false;
+    }
+  }
+
+  return coveredElements.size() == static_cast<size_t>(*destinationCount);
+}
+
 static bool dpsInitCopyCanBeElided(DestinationStyleOpInterface dpsOp,
                                    OpOperand *forwardedInitOperand) {
-  auto linalgOp = dyn_cast<linalg::LinalgOp>(dpsOp.getOperation());
-  return linalgOp &&
-         linalgOpFullyOverwritesInit(linalgOp, forwardedInitOperand);
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(dpsOp.getOperation())) {
+    return linalgOpFullyOverwritesInit(linalgOp, forwardedInitOperand);
+  }
+  if (auto scatterOp =
+          dyn_cast<IREE::LinalgExt::ScatterOp>(dpsOp.getOperation())) {
+    return scatterFullyOverwritesInit(scatterOp, forwardedInitOperand);
+  }
+  return false;
 }
 
 struct FoldTemporaryCopyIntoDpsOp final : OpRewritePattern<memref::CopyOp> {

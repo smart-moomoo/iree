@@ -54,6 +54,93 @@ func.func @no_fold_copy_source_aliases_target(%target: memref<4xf32>) {
 
 // -----
 
+memref.global "private" constant @full_scatter_indices : memref<4x1xi32> = dense<[[3], [1], [0], [2]]>
+
+func.func @elide_full_scatter_init_copy() {
+  %source = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  %updates = memref.alloc() : memref<4xf32>
+  %indices = memref.get_global @full_scatter_indices : memref<4x1xi32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  iree_linalg_ext.scatter dimension_map = [0] unique_indices(true)
+      ins(%updates, %indices : memref<4xf32>, memref<4x1xi32>)
+      outs(%temp : memref<4xf32>) {
+  ^bb0(%update: f32, %old: f32):
+    iree_linalg_ext.yield %update : f32
+  }
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @elide_full_scatter_init_copy(
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK-NOT: memref.copy
+// CHECK: iree_linalg_ext.scatter
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
+memref.global "private" constant @partial_scatter_indices : memref<2x1xi32> = dense<[[0], [2]]>
+
+func.func @preserve_init_copy_for_partial_scatter() {
+  %source = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  %updates = memref.alloc() : memref<2xf32>
+  %indices = memref.get_global @partial_scatter_indices : memref<2x1xi32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  iree_linalg_ext.scatter dimension_map = [0] unique_indices(true)
+      ins(%updates, %indices : memref<2xf32>, memref<2x1xi32>)
+      outs(%temp : memref<4xf32>) {
+  ^bb0(%update: f32, %old: f32):
+    iree_linalg_ext.yield %update : f32
+  }
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @preserve_init_copy_for_partial_scatter(
+// CHECK-DAG: %[[SOURCE:.+]] = memref.alloc
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK: memref.copy %[[SOURCE]], %[[TARGET]]
+// CHECK: iree_linalg_ext.scatter
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
+memref.global "private" constant @combining_scatter_indices : memref<4x1xi32> = dense<[[0], [1], [2], [3]]>
+
+func.func @preserve_init_copy_for_combining_scatter() {
+  %source = memref.alloc() : memref<4xf32>
+  %target = memref.alloc() : memref<4xf32>
+  %temp = memref.alloc() : memref<4xf32>
+  %updates = memref.alloc() : memref<4xf32>
+  %indices = memref.get_global @combining_scatter_indices : memref<4x1xi32>
+  memref.copy %source, %temp : memref<4xf32> to memref<4xf32>
+  iree_linalg_ext.scatter dimension_map = [0] unique_indices(true)
+      ins(%updates, %indices : memref<4xf32>, memref<4x1xi32>)
+      outs(%temp : memref<4xf32>) {
+  ^bb0(%update: f32, %old: f32):
+    %sum = arith.addf %update, %old : f32
+    iree_linalg_ext.yield %sum : f32
+  }
+  memref.copy %temp, %target : memref<4xf32> to memref<4xf32>
+  return
+}
+
+// CHECK-LABEL: func.func @preserve_init_copy_for_combining_scatter(
+// CHECK-DAG: %[[SOURCE:.+]] = memref.alloc
+// CHECK-DAG: %[[TARGET:.+]] = memref.alloc
+// CHECK: memref.copy %[[SOURCE]], %[[TARGET]]
+// CHECK: iree_linalg_ext.scatter
+// CHECK-SAME: outs(%[[TARGET]] : memref<4xf32>)
+// CHECK-NOT: memref.copy
+
+// -----
+
 func.func @elide_linalg_fill_init_copy() {
   %c0 = arith.constant 0.0 : f32
   %source = memref.alloc() : memref<4xf32>

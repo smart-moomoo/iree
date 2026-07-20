@@ -1367,14 +1367,10 @@ util.func public @multiCloneImmutableSource(%size: index) -> (!stream.resource<*
 
 // -----
 
-// Missed optimization: Copy writes to [0, 16) which fully contains the update
-// region [4, 8), so the update could theoretically be elided. However, we
-// currently only check for exact range matches, not supersets. This is
-// conservative (safe) behavior - improving this would require integer range
-// analysis to prove containment.
-// CHECK-LABEL: @updateNotElided_copyWritesSupersetRegion
+// A later copy of [0, 16) makes an earlier update of [4, 8) unobservable.
+// CHECK-LABEL: @updateElided_copyWritesSupersetRegion
 // CHECK-SAME: (%[[SIZE:.+]]: index)
-util.func private @updateNotElided_copyWritesSupersetRegion(
+util.func private @updateElided_copyWritesSupersetRegion(
     %size: index) -> !stream.resource<*> {
   %c0 = arith.constant 0 : index
   %c4 = arith.constant 4 : index
@@ -1391,19 +1387,77 @@ util.func private @updateNotElided_copyWritesSupersetRegion(
   // Create data to update into subregion [4, 8).
   // CHECK: %[[UPDATE_SRC:.+]] = stream.async.splat %c123_i32 : i32 -> !stream.resource<*>{%[[C4]]}
   %update_src = stream.async.splat %c123_i32 : i32 -> !stream.resource<*>{%c4}
-  // Update writes to [4, 8). Not elided because copy writes superset [0, 16).
-  // CHECK: %[[UPDATED:.+]] = stream.async.update %[[UPDATE_SRC]], %[[ALLOCA]][%[[C4]] to %[[C8]]]
+  // CHECK-NOT: stream.async.update
   %updated = stream.async.update %update_src, %alloca[%c4 to %c8]
       : !stream.resource<*>{%c4} -> %alloca as !stream.resource<*>{%size}
   // Create source for copy that writes superset region [0, 16).
   // CHECK: %[[COPY_SRC:.+]] = stream.async.splat %c123_i32 : i32 -> !stream.resource<*>{%[[C16]]}
   %copy_src = stream.async.splat %c123_i32 : i32 -> !stream.resource<*>{%c16}
-  // Copy writes [0, 16) which fully contains [4, 8) but we don't detect this.
-  // CHECK: %[[COPY:.+]] = stream.async.copy %[[COPY_SRC]][%[[C0]] to %[[C16]]], %[[UPDATED]][%[[C0]] to %[[C16]]], %[[C16]]
+  // CHECK: %[[COPY:.+]] = stream.async.copy %[[COPY_SRC]][%[[C0]] to %[[C16]]], %[[ALLOCA]][%[[C0]] to %[[C16]]], %[[C16]]
   %copy = stream.async.copy %copy_src[%c0 to %c16], %updated[%c0 to %c16], %c16
       : !stream.resource<*>{%c16} -> %updated as !stream.resource<*>{%size}
   // CHECK: util.return %[[COPY]]
   util.return %copy : !stream.resource<*>
+}
+
+// -----
+
+// A containing chained update also makes the first update unobservable.
+// CHECK-LABEL: @updateElided_chainedSupersetRegion
+util.func private @updateElided_chainedSupersetRegion()
+    -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  %c8 = arith.constant 8 : index
+  %c16 = arith.constant 16 : index
+  %c1_i8 = arith.constant 1 : i8
+  %c2_i8 = arith.constant 2 : i8
+  // CHECK: %[[TARGET:.+]] = stream.async.splat
+  %target = stream.async.splat %c1_i8 : i8 -> !stream.resource<*>{%c16}
+  %first_source = stream.async.splat %c1_i8 : i8 -> !stream.resource<*>{%c4}
+  // CHECK: %[[SECOND_SOURCE:.+]] = stream.async.splat %c2_i8
+  %second_source = stream.async.splat %c2_i8 : i8 -> !stream.resource<*>{%c16}
+  // CHECK-NOT: stream.async.update %{{.+}}, %[[TARGET]][%c4 to %c8]
+  %first = stream.async.update %first_source, %target[%c4 to %c8]
+      : !stream.resource<*>{%c4} -> %target as !stream.resource<*>{%c16}
+  // CHECK: %[[SECOND:.+]] = stream.async.update %[[SECOND_SOURCE]], %[[TARGET]][%c0 to %c16]
+  %second = stream.async.update %second_source, %first[%c0 to %c16]
+      : !stream.resource<*>{%c16} -> %first as !stream.resource<*>{%c16}
+  // CHECK: util.return %[[SECOND]]
+  util.return %second : !stream.resource<*>
+}
+
+// -----
+
+stream.executable private @ex_disjoint_read {
+  stream.executable.export public @dispatch workgroups() -> (index, index, index) {
+    %c1 = arith.constant 1 : index
+    stream.return %c1, %c1, %c1 : index, index, index
+  }
+}
+
+// A read of [8, 12) cannot observe an update of [0, 4), even when the
+// constants were materialized as distinct SSA values.
+// CHECK-LABEL: @updateElided_beforeDisjointRead
+util.func private @updateElided_beforeDisjointRead() -> !stream.resource<*> {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  %c8 = arith.constant 8 : index
+  %c12 = arith.constant 12 : index
+  %c16 = arith.constant 16 : index
+  %c1_i8 = arith.constant 1 : i8
+  // CHECK: %[[TARGET:.+]] = stream.async.alloca
+  %target = stream.async.alloca : !stream.resource<*>{%c16}
+  %source = stream.async.splat %c1_i8 : i8 -> !stream.resource<*>{%c4}
+  // CHECK-NOT: stream.async.update
+  %updated = stream.async.update %source, %target[%c0 to %c4]
+      : !stream.resource<*>{%c4} -> %target as !stream.resource<*>{%c16}
+  // CHECK: %[[DISPATCH:.+]] = stream.async.dispatch @ex_disjoint_read::@dispatch(%[[TARGET]][%c8 to %c12 for %c4])
+  %dispatch = stream.async.dispatch @ex_disjoint_read::@dispatch(
+      %updated[%c8 to %c12 for %c4])
+      : (!stream.resource<*>{%c16}) -> !stream.resource<*>{%c4}
+  // CHECK: util.return %[[DISPATCH]]
+  util.return %dispatch : !stream.resource<*>
 }
 
 // -----

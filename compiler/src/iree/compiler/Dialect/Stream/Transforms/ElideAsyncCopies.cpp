@@ -1343,8 +1343,7 @@ static void elideSliceOp(IREE::Stream::AsyncSliceOp sliceOp) {
 // Returns true if |user| is a tied operation that fully overwrites the region
 // written by |updateOp|. When a tied operation's result aliases the update's
 // target buffer, downstream reads might access the update region. This is only
-// safe if the tied operation writes to the exact same region (fully
-// overwriting the update's data).
+// safe if the tied operation writes a region containing all of the update.
 static bool doesTiedOpFullyOverwriteUpdate(Operation *user,
                                            IREE::Stream::AsyncUpdateOp updateOp,
                                            Value target, Value result) {
@@ -1380,10 +1379,11 @@ static bool doesTiedOpFullyOverwriteUpdate(Operation *user,
       if (range.isReadOnly()) {
         continue;
       }
-      // Check if this write fully covers our update region.
-      bool sameStart = (range.start == updateOp.getTargetOffset());
-      bool sameEnd = (range.end == updateOp.getTargetEnd());
-      if (sameStart && sameEnd) {
+      AsyncAccessRange updateRange{
+          ResourceAccessBitfield::Write, range.resource,
+          updateOp.getTargetOffset(), updateOp.getTargetEnd(),
+          updateOp.getUpdateSize()};
+      if (AsyncAccessRange::contains(range, updateRange)) {
         return true; // Found a write that fully overwrites.
       }
     }
@@ -1456,15 +1456,13 @@ static bool isSafeToElideUpdateOp(IREE::Stream::AsyncUpdateOp updateOp,
     // downstream reads of that result will read our region indirectly.
     if (auto nextUpdate = dyn_cast<IREE::Stream::AsyncUpdateOp>(user)) {
       if (nextUpdate.getTarget() == result) {
-        // Check if the next update fully overwrites our write region.
-        // This handles patterns like: alloca -> update[0:4] -> update[0:4]
-        // where the second update completely replaces the first.
-        bool sameStart =
-            (nextUpdate.getTargetOffset() == updateOp.getTargetOffset());
-        bool sameEnd = (nextUpdate.getTargetEnd() == updateOp.getTargetEnd());
-        if (sameStart && sameEnd) {
+        AsyncAccessRange nextUpdateRange{
+            ResourceAccessBitfield::Write, result,
+            nextUpdate.getTargetOffset(), nextUpdate.getTargetEnd(),
+            nextUpdate.getUpdateSize()};
+        if (AsyncAccessRange::contains(nextUpdateRange, updateRange)) {
           LLVM_DEBUG(llvm::dbgs()
-                     << "  ? chained update fully overwrites same region; "
+                     << "  ? chained update fully overwrites region; "
                         "continuing analysis\n");
           // This chained update overwrites our write - safe to continue
           // checking other users.
@@ -1514,10 +1512,6 @@ static bool isSafeToElideUpdateOp(IREE::Stream::AsyncUpdateOp updateOp,
         }
 
         LLVM_DEBUG(llvm::dbgs() << "    Checking overlap...\n");
-        // TODO(benvanik): use integer range analysis (Presburger) to prove
-        // disjoint constant ranges don't overlap. Currently we conservatively
-        // assume overlap unless start == end (adjacent) or different resources.
-        // Check for overlap with the updated region.
         if (IREE::Stream::AsyncAccessRange::mayOverlap(updateRange,
                                                        userRange)) {
           LLVM_DEBUG(llvm::dbgs() << "    Ranges overlap!\n");

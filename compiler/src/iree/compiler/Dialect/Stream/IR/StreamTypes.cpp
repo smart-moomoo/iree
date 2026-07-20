@@ -11,6 +11,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/IR/DialectImplementation.h"
+#include "mlir/IR/Matchers.h"
 
 // clang-format off: must be included after all LLVM/MLIR headers.
 #define GET_ATTRDEF_CLASSES
@@ -95,6 +96,30 @@ void AsyncAccessRange::print(llvm::raw_ostream &os, AsmState &asmState) {
   os << "]";
 }
 
+static std::optional<int64_t> getConstantRangeBound(Value value) {
+  if (!value) {
+    return 0;
+  }
+  APInt constant;
+  if (!matchPattern(value, m_ConstantInt(&constant)) ||
+      constant.getBitWidth() > 64) {
+    return std::nullopt;
+  }
+  return constant.getSExtValue();
+}
+
+// Proves lhs <= rhs using SSA identity or integer constants. This intentionally
+// does not reason through arithmetic; callers remain conservative for dynamic
+// bounds until a value-bounds analysis is available here.
+static bool isKnownLessThanOrEqual(Value lhs, Value rhs) {
+  if (lhs == rhs) {
+    return true;
+  }
+  std::optional<int64_t> lhsConstant = getConstantRangeBound(lhs);
+  std::optional<int64_t> rhsConstant = getConstantRangeBound(rhs);
+  return lhsConstant && rhsConstant && *lhsConstant <= *rhsConstant;
+}
+
 // static
 bool AsyncAccessRange::mayOverlap(const AsyncAccessRange &lhs,
                                   const AsyncAccessRange &rhs) {
@@ -104,18 +129,30 @@ bool AsyncAccessRange::mayOverlap(const AsyncAccessRange &lhs,
     return false;
   }
 
-  // Check for adjacent but not overlapping.
-  if (lhs.end == rhs.start || lhs.start == rhs.end) {
+  // Half-open ranges do not overlap when one ends before the other starts. For
+  // example, [0, 4) and [8, 12) are disjoint even though no bounds share an SSA
+  // value.
+  if (isKnownLessThanOrEqual(lhs.end, rhs.start) ||
+      isKnownLessThanOrEqual(rhs.end, lhs.start)) {
     return false;
   }
 
-  // TODO(benvanik): use integer range analysis (Presburger) to prove when
-  // constant or affine ranges like [100,200) and [500,600) don't overlap.
-  // This would enable more aggressive optimization in ElideAsyncCopies and
-  // other passes that use overlap checking.
+  // TODO(benvanik): use integer range analysis (Presburger) for dynamic and
+  // affine bounds that cannot be compared locally.
 
   // _May_ overlap. More analysis required.
   return true;
+}
+
+// static
+bool AsyncAccessRange::contains(const AsyncAccessRange &outer,
+                                const AsyncAccessRange &inner) {
+  if (outer.resource != inner.resource) {
+    return false;
+  }
+  // [0, 16) contains [4, 8) because 0 <= 4 and 8 <= 16.
+  return isKnownLessThanOrEqual(outer.start, inner.start) &&
+         isKnownLessThanOrEqual(inner.end, outer.end);
 }
 
 Value joinTimepoints(Location loc, ValueRange timepoints, OpBuilder &builder) {

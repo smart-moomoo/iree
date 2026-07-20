@@ -70,6 +70,11 @@ struct AsyncAccessRange {
   // locally proven that they do not.
   static bool mayOverlap(const AsyncAccessRange &lhs,
                          const AsyncAccessRange &rhs);
+
+  // Returns true only if it can be locally proven that |outer| contains all of
+  // |inner|. Resource identity and equal or constant bounds are recognized.
+  static bool contains(const AsyncAccessRange &outer,
+                       const AsyncAccessRange &inner);
 };
 
 // Joins all of |timepoints| with a stream.timepoint.join, representing the
